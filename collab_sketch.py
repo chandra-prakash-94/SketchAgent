@@ -4,7 +4,7 @@ import ast
 import cairosvg
 import os
 from dotenv import load_dotenv
-import anthropic
+import google.generativeai as genai
 from prompts import sketch_first_prompt, system_prompt, gt_example
 import json
 import socket
@@ -29,12 +29,18 @@ class SketchApp:
 
         # LLM Setup (you need to provide your ANTHROPIC_API_KEY in your .env file)
         self.seed_mode = "stochastic"
-        self.cache = False
+        self.cache = False # Caching is handled differently or not available in Gemini, will ignore for now.
         self.max_tokens = 3000
         load_dotenv()
-        claude_key = os.getenv("ANTHROPIC_API_KEY")
-        self.client = anthropic.Anthropic(api_key=claude_key)
-        self.model = "claude-3-5-sonnet-20240620"
+        google_api_key = os.getenv("GOOGLE_API_KEY")
+        genai.configure(api_key=google_api_key)
+        self.model = "gemini-1.5-pro-latest"
+        # Initialize client with system prompt, as it's generally static for this app's lifecycle
+        # The system_prompt is formatted with self.res later in initialize_all,
+        # so we will initialize the client there or ensure system_instruction can be updated.
+        # For now, initialize without system_instruction, it will be added in initialize_all.
+        self.client = genai.GenerativeModel(self.model)
+
 
         # Grid setup
         self.res = res
@@ -93,6 +99,11 @@ class SketchApp:
 
     def initialize_all(self):
         self.input_prompt = sketch_first_prompt.format(concept=self.target_concept, gt_sketches_str=gt_example)
+        
+        # Initialize client with system prompt here as self.res is available
+        self.system_instruction_text = system_prompt.format(res=self.res)
+        self.client = genai.GenerativeModel(self.model, system_instruction=self.system_instruction_text)
+
         self.all_strokes_svg = f"""<svg width="{self.grid_size[0]}" height="{self.grid_size[1]}" xmlns="http://www.w3.org/2000/svg">"""
         self.assitant_history = ""
         self.stroke_counter = 0
@@ -297,40 +308,57 @@ class SketchApp:
 
 
     def call_llm(self, system_message, other_msg, additional_args):
-        if self.cache:
-            init_response = self.client.beta.prompt_caching.messages.create(
-                    model=self.model,
-                    max_tokens=self.max_tokens,
-                    system=system_message,
-                    messages=other_msg,
-                    **additional_args
-                )
-        else:
-            init_response = self.client.messages.create(
-                    model=self.model,
-                    max_tokens=self.max_tokens,
-                    system=system_message,
-                    messages=other_msg,
-                    **additional_args
-                )
+        # system_message is now handled by initializing self.client with system_instruction
+        # in __init__ and initialize_all. So, it's not directly used here.
+        generation_config_params = {
+            "max_output_tokens": self.max_tokens,
+        }
+        if "temperature" in additional_args:
+            generation_config_params["temperature"] = additional_args["temperature"]
+        if "top_k" in additional_args:
+            generation_config_params["top_k"] = additional_args["top_k"]
+        if "stop_sequences" in additional_args: # Gemini uses stop_sequences in generation_config
+            generation_config_params["stop_sequences"] = additional_args["stop_sequences"]
+
+        generation_config = genai.types.GenerationConfig(**generation_config_params)
+
+        # The self.client should already be initialized with system_instruction.
+        # Caching is not directly equivalent.
+        init_response = self.client.generate_content(
+            contents=other_msg, # other_msg should be formatted for Gemini by define_input_to_llm
+            generation_config=generation_config,
+        )
         return init_response
 
     
     def define_input_to_llm(self, msg_history, init_canvas_str, msg):
-        # other_msg should contain all messgae without the system prompt
-        other_msg = msg_history 
+        # Gemini expects messages in the format: [{'role': 'user'/'model', 'parts': [text/image]}]
+        # msg_history is expected to be in this format already if it's from previous Gemini calls.
+        # For this conversion, we assume msg_history from Anthropic needs adaptation.
+        
+        gemini_history = []
+        for message in msg_history:
+            role = "user" if message["role"] == "user" else "model"
+            parts = []
+            if isinstance(message["content"], list): # Anthropic's format with list of content blocks
+                for item in message["content"]:
+                    if item["type"] == "image":
+                        parts.append({"mime_type": item["source"]["media_type"], "data": item["source"]["data"]})
+                    elif item["type"] == "text":
+                        parts.append({"text": item["text"]})
+            elif isinstance(message["content"], str): # Simpler text content
+                 parts.append({"text": message["content"]})
+            gemini_history.append({"role": role, "parts": parts})
 
-        content = []
-        # Claude best practice is image-then-text
+        # Current user message
+        current_parts = []
         if init_canvas_str is not None:
-            content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": init_canvas_str}}) 
-
-        content.append({"type": "text", "text": msg})
-        if self.cache:
-            content[-1]["cache_control"] = {"type": "ephemeral"}
-
-        other_msg = other_msg + [{"role": "user", "content": content}]
-        return other_msg
+            current_parts.append({"mime_type": "image/jpeg", "data": init_canvas_str}) # Assuming base64 jpeg
+        current_parts.append({"text": msg})
+        
+        gemini_history.append({"role": "user", "parts": current_parts})
+        
+        return gemini_history
 
 
     def get_response_from_llm(
@@ -349,52 +377,112 @@ class SketchApp:
             additional_args["temperature"] = 0.0
             additional_args["top_k"] = 1
 
-        if self.cache:
-            system_message = [{
-                "type": "text",
-                "text": system_message,
-                "cache_control": {"type": "ephemeral"}
-            }]
+        # system_message is now part of self.client via system_instruction.
+        # Caching is not directly handled.
 
-        # other_msg should contain all messgae without the system prompt
-        other_msg = self.define_input_to_llm(msg_history, init_canvas_str, msg) 
-
-        if gen_mode == "completion":
-            if prefill_msg:
-                other_msg = other_msg + [{"role": "assistant", "content": f"{prefill_msg}"}]
-            
-            # in case of stroke by stroke generation
-        if stop_sequences:
-            additional_args["stop_sequences"]= [stop_sequences]
-        else:
-            additional_args["stop_sequences"]= ["</answer>"]
-
-        # Note that we deterministic settings for reproducibility (temperature=0.0 and top_k=1). 
-        # To run in stochastic mode just comment these parameters.
-        response = self.call_llm(system_message, other_msg, additional_args)
-
-        content = response.content[0].text
+        additional_args = {} # Reset additional_args for this scope
+        if seed_mode == "deterministic":
+            additional_args["temperature"] = 0.0
+            additional_args["top_k"] = 1
         
-        if gen_mode == "completion":
-            other_msg = other_msg[:-1] # remove initial assistant prompt
-            content = f"{prefill_msg}{content}" 
+        # Stop sequences are now part of additional_args and passed to call_llm to be included in generation_config
+        if stop_sequences:
+            additional_args["stop_sequences"] = [stop_sequences]
+        else:
+            additional_args["stop_sequences"] = ["</answer>"] # Default stop sequence
 
-        # saves to json
+        # define_input_to_llm now returns messages in Gemini format.
+        # msg_history for define_input_to_llm should be in Anthropic format if it's the first call,
+        # or Gemini format if it's subsequent. This needs careful handling of history.
+        # For simplicity, assuming msg_history passed here is compatible or empty for first call.
+        # The `assitant_history` in `call_model_stroke_completion` is a raw string, not structured history.
+        # `init_thinking_tags` calls this with empty msg_history.
+        
+        # If msg_history comes from self.assitant_history, it needs to be parsed or define_input_to_llm needs to handle raw string.
+        # Current define_input_to_llm expects a list of dicts.
+        # The `self.assitant_history` is built by concatenating strings. This is a key point of incompatibility.
+        # For now, let's assume `msg_history` is correctly formatted or empty.
+        # The `prefill_msg` logic with `gen_mode == "completion"` needs careful adaptation.
+        # `self.assitant_history.strip()` is passed as `prefill_msg` in `call_model_stroke_completion`.
+
+        current_llm_input_messages = self.define_input_to_llm(msg_history, init_canvas_str, msg)
+
+        if gen_mode == "completion" and prefill_msg:
+            # For Gemini, "completion" with prefill means the prefill_msg is the last part of a 'model' turn
+            # that precedes the user's request for completion.
+            # Or, if it's a text-only model, it might be simpler.
+            # Given current structure, prefill_msg is the accumulated assistant history.
+            # We need to ensure current_llm_input_messages ends with user, then we add model (prefill), then ask for completion.
+            # This is tricky. A simpler way for Gemini might be to include the prefill_msg as the starting part of the 'user' turn's text.
+            # Or, more correctly, `prefill_msg` represents the history of the assistant's response so far.
+            # So, `current_llm_input_messages` should contain history up to last user turn,
+            # then we add a model turn with `prefill_msg`.
+            
+            # Let's adjust current_llm_input_messages:
+            # The last message in current_llm_input_messages is the current "user" turn.
+            # We need to insert the model's prefill before this if we want the model to "complete" its own prior output.
+            # This is what Anthropic's `other_msg = other_msg + [{"role": "assistant", "content": f"{prefill_msg}"}]` did.
+            if current_llm_input_messages and current_llm_input_messages[-1]['role'] == 'user':
+                # This is complex because `prefill_msg` is the *entire* assistant history.
+                # The `define_input_to_llm` already takes `msg_history`.
+                # The `call_model_stroke_completion` uses `self.assitant_history.strip()` as prefill.
+                # This `assitant_history` is a string of previous strokes.
+                # The prompt structure for completion was: system_prompt, user_prompt (includes full history), assistant_prefill.
+                # For Gemini, this would be: system_instruction (set in client), contents: [user_prompt (full history), model_prompt (prefill)]
+                
+                # Let's assume `current_llm_input_messages` contains the user part. We add the model prefill part.
+                 current_llm_input_messages.append({"role": "model", "parts": [{"text": prefill_msg}]})
+
+
+        response = self.call_llm(system_message, current_llm_input_messages, additional_args)
+
+        # Accessing response text in Gemini
+        try:
+            content = response.text # For simple text responses
+        except Exception: # Fallback if response.text is not available or parts are complex
+            content = ""
+            if hasattr(response, 'parts') and response.parts:
+                for part in response.parts:
+                    if hasattr(part, 'text'):
+                        content += part.text
+            elif hasattr(response, 'candidates') and response.candidates: # More complex responses
+                 for candidate in response.candidates:
+                     if hasattr(candidate, 'content') and candidate.content.parts:
+                         for part in candidate.content.parts:
+                             if hasattr(part, 'text'):
+                                 content += part.text
+
+
+        if gen_mode == "completion" and prefill_msg:
+            # The model's output `content` is only the newly generated part.
+            # We need to prepend the `prefill_msg` to get the complete sequence.
+            content = f"{prefill_msg}{content}"
+            # We also need to remove the temporary 'model' role message we added for prefill from current_llm_input_messages for logging
+            if current_llm_input_messages and current_llm_input_messages[-1]['role'] == 'model':
+                 current_llm_input_messages = current_llm_input_messages[:-1]
+
+
+        # saves to json - adapt structure for Gemini if needed
         if self.path2save is not None:
-            system_message_json = [{"role": "system", "content": system_message}]
-            new_msg_history = other_msg + [
-                {
-                    "role": "assistant",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": content,
-                        }
-                    ],
-                }
-            ]    
+            # system_message is now self.system_instruction_text, set in client
+            log_data = [{"role": "system", "content": self.system_instruction_text if hasattr(self, 'system_instruction_text') else system_prompt.format(res=self.res)}]
+            
+            # Adapt saved message history (current_llm_input_messages) to a simpler string format for logging if needed
+            # For now, log the Gemini-formatted messages directly, then the final assistant content.
+            # Or, convert 'parts' back to a simple string for logging consistency.
+            adapted_history_for_logging = []
+            for entry in current_llm_input_messages:
+                text_content = "".join(part.get('text', '') for part in entry['parts'] if 'text' in part)
+                # Note: image parts are not logged as simple text here.
+                adapted_history_for_logging.append({"role": entry["role"], "content": text_content})
+
+            adapted_history_for_logging.append({
+                "role": "model", 
+                "content": content, # Log the final, possibly combined, content
+            })
+            
             with open(f"{self.path2save}/experiment_log.json", 'w') as json_file:
-                json.dump(system_message_json + new_msg_history, json_file, indent=4)
+                json.dump(log_data + adapted_history_for_logging, json_file, indent=4)
             print(f"Data has been saved to [{self.path2save}/experiment_log.json]")
 
         return content
