@@ -1,5 +1,5 @@
 import argparse
-import anthropic
+import google.generativeai as genai
 import ast
 import cairosvg
 import json
@@ -19,7 +19,7 @@ def call_argparse():
     parser.add_argument('--concept_to_draw', type=str, default="cat")
     parser.add_argument('--seed_mode', type=str, default='deterministic', choices=['deterministic', 'stochastic'])
     parser.add_argument('--path2save', type=str, default=f"results/test")
-    parser.add_argument('--model', type=str, default='claude-3-5-sonnet-20240620')
+    parser.add_argument('--model', type=str, default='gemini-1.5-pro-latest')
     parser.add_argument('--gen_mode', type=str, default='generation', choices=['generation', 'completion'])
 
     # Grid params
@@ -61,8 +61,9 @@ class SketchApp:
         self.cache = False
         self.max_tokens = 3000
         load_dotenv()
-        claude_key = os.getenv("ANTHROPIC_API_KEY")
-        self.client = anthropic.Anthropic(api_key=claude_key)
+        google_api_key = os.getenv("GOOGLE_API_KEY")
+        genai.configure(api_key=google_api_key)
+        self.client = genai.GenerativeModel(args.model)
         self.model = args.model
         self.input_prompt = sketch_first_prompt.format(concept=args.concept_to_draw, gt_sketches_str=gt_example)
         self.gen_mode = args.gen_mode
@@ -70,39 +71,50 @@ class SketchApp:
         
 
     def call_llm(self, system_message, other_msg, additional_args):
-        if self.cache:
-            init_response = self.client.beta.prompt_caching.messages.create(
-                    model=self.model,
-                    max_tokens=self.max_tokens,
-                    system=system_message,
-                    messages=other_msg,
-                    **additional_args
-                )
-        else:
-            init_response = self.client.messages.create(
-                    model=self.model,
-                    max_tokens=self.max_tokens,
-                    system=system_message,
-                    messages=other_msg,
-                    **additional_args
-                )
+        generation_config = {
+            "max_output_tokens": self.max_tokens,
+        }
+        if "temperature" in additional_args:
+            generation_config["temperature"] = additional_args["temperature"]
+        if "top_k" in additional_args:
+            generation_config["top_k"] = additional_args["top_k"]
+
+        # For Gemini, the system message is passed as `system_instruction`
+        # and messages are passed to `contents`
+        # The caching functionality is not directly mapped here, assuming no direct equivalent for simplicity
+        init_response = self.client.generate_content(
+            contents=other_msg,
+            generation_config=genai.types.GenerationConfig(**generation_config),
+            system_instruction=system_message if isinstance(system_message, str) else system_message[0]['text'] # Handle both str and list cases for system_message
+        )
         return init_response
 
     
     def define_input_to_llm(self, msg_history, init_canvas_str, msg):
-        # other_msg should contain all messgae without the system prompt
-        other_msg = msg_history 
+        # Gemini expects messages in the format: [{'role': 'user'/'model', 'parts': [text/image]}]
+        other_msg = []
+        for message in msg_history:
+            if isinstance(message['content'], list): # Handle cases where content is a list of dicts
+                 parts = []
+                 for item in message['content']:
+                     if item['type'] == 'image':
+                         parts.append({'mime_type': item['source']['media_type'], 'data': item['source']['data']})
+                     elif item['type'] == 'text':
+                         parts.append({'text': item['text']})
+                 other_msg.append({'role': 'user' if message['role'] == 'user' else 'model', 'parts': parts})
+            else: # Handle cases where content is a simple string
+                 other_msg.append({'role': 'user' if message['role'] == 'user' else 'model', 'parts': [{'text': message['content']}]})
 
-        content = []
-        # Claude best practice is image-then-text
+
+        current_content_parts = []
         if init_canvas_str is not None:
-            content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": init_canvas_str}}) 
+            # Assuming init_canvas_str is base64 encoded JPEG
+            current_content_parts.append({"mime_type": "image/jpeg", "data": init_canvas_str})
 
-        content.append({"type": "text", "text": msg})
-        if self.cache:
-            content[-1]["cache_control"] = {"type": "ephemeral"}
-
-        other_msg = other_msg + [{"role": "user", "content": content}]
+        current_content_parts.append({"text": msg})
+        
+        # Add the current message to other_msg
+        other_msg.append({"role": "user", "parts": current_content_parts})
         return other_msg
         
 
@@ -122,49 +134,69 @@ class SketchApp:
             additional_args["temperature"] = 0.0
             additional_args["top_k"] = 1
 
-        if self.cache:
-            system_message = [{
-                "type": "text",
-                "text": system_message,
-                "cache_control": {"type": "ephemeral"}
-            }]
+        # Caching is not directly handled in Gemini's SDK in the same way as Anthropics's beta.
+        # System message is handled by call_llm for Gemini.
 
-        # other_msg should contain all messgae without the system prompt
-        other_msg = self.define_input_to_llm(msg_history, init_canvas_str, msg) 
+        other_msg = self.define_input_to_llm(msg_history, init_canvas_str, msg)
 
         if gen_mode == "completion":
             if prefill_msg:
-                other_msg = other_msg + [{"role": "assistant", "content": f"{prefill_msg}"}]
-            
-        # In case of stroke by stroke generation
-        if stop_sequences:
-            additional_args["stop_sequences"]= [stop_sequences]
-        else:
-            additional_args["stop_sequences"]= ["</answer>"]
- 
-        response = self.call_llm(system_message, other_msg, additional_args)
-        content = response.content[0].text
+                # Gemini's completion equivalent is to have the prefill as the last part of the 'model' role message.
+                # This is a simplified adaptation; true few-shot or completion might need more specific formatting.
+                other_msg.append({"role": "model", "parts": [{"text": prefill_msg}]})
         
-        if gen_mode == "completion":
-            other_msg = other_msg[:-1] # remove initial assistant prompt
-            content = f"{prefill_msg}{content}" 
+        # Stop sequences are part of generation_config in Gemini
+        if stop_sequences:
+            additional_args["stop_sequences"] = [stop_sequences]
+        else:
+            # Gemini uses 'stop_sequences' in generation_config, not directly in additional_args for the main call
+            additional_args["stop_sequences"] = ["</answer>"]
+            
+        response = self.call_llm(system_message, other_msg, additional_args)
+        
+        # Accessing response text in Gemini
+        try:
+            content = response.text
+        except Exception as e: # Added to catch potential errors with accessing response.text if it's not available.
+            print(f"Error accessing response text: {e}")
+            # Fallback or error handling if response.text is not directly available or parts need to be parsed
+            content = "" 
+            if response.parts:
+                for part in response.parts:
+                    if hasattr(part, 'text'):
+                         content += part.text
 
-        # saves to json
+
+        if gen_mode == "completion":
+            # If there was a prefill, Gemini's response will be the completion part.
+            # We need to combine it with the prefill_msg for the full content.
+            content = f"{prefill_msg}{content}"
+            if other_msg[-1]['role'] == 'model': # remove our added model prefill
+                other_msg = other_msg[:-1]
+
+
+        # saves to json - adapt structure for Gemini if needed
         if self.path2save is not None:
-            system_message_json = [{"role": "system", "content": system_message}]
-            new_msg_history = other_msg + [
-                {
-                    "role": "assistant",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": content,
-                        }
-                    ],
-                }
-            ]    
+            # For Gemini, system_instruction is separate. History is a list of {'role': ..., 'parts': ...}
+            # We'll save the system prompt and then the message history.
+            log_data = [{"role": "system", "content": system_message if isinstance(system_message, str) else system_message[0]['text']}]
+            
+            # Adapt saved message history to a more generic format or keep as is if it's for logging purposes primarily
+            # For now, keep it similar to the input structure for simplicity in logging
+            # Convert 'parts' back to a simpler 'content' string for logging consistency if desired, or log 'parts' directly.
+            adapted_history_for_logging = []
+            for entry in other_msg:
+                # Simplified logging: combine text parts. Image parts are not easily logged as simple text.
+                text_content = "".join(part.get('text', '') for part in entry['parts'] if 'text' in part)
+                adapted_history_for_logging.append({"role": entry["role"], "content": text_content})
+
+            adapted_history_for_logging.append({
+                "role": "model", # Gemini uses 'model' for assistant
+                "content": content,
+            })
+            
             with open(f"{self.path2save}/experiment_log.json", 'w') as json_file:
-                json.dump(system_message_json + new_msg_history, json_file, indent=4)
+                json.dump(log_data + adapted_history_for_logging, json_file, indent=4)
             print(f"Data has been saved to [{self.path2save}/experiment_log.json]")
         return content
 

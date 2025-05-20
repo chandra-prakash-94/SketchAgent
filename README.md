@@ -45,11 +45,11 @@ conda uninstall cairosvg && conda install cairosvg
 ```
 
 #### API Key
-This repository requires an Anthropic API key. If you don't have one, [create an Anthropic account](https://console.anthropic.com/login) and follow the instructions to obtain a key.
+This repository requires a Google API key. If you don't have one, you can create one via [Google AI Studio](https://aistudio.google.com/app/apikey) or the [Google Cloud Console](https://console.cloud.google.com/apis/credentials). Make sure the Gemini API is enabled for your project.
 
 Once you have the key, save it in the ```.env``` file:
 ```
-ANTHROPIC_API_KEY=<your_key>
+GOOGLE_API_KEY=<your_key>
 ```
 
 # Start Sketching! :woman_artist: :art:
@@ -89,7 +89,7 @@ Use the text box to change the concept to be drawn.
 
 - [ ] Add support for chat based editing.
 - [ ] Add SVG drawing process animations in HTML.
-- [ ] Add support of other backbone models (GPT4o, LLama3).
+- [X] Add support for Gemini 1.5 Pro. (Further support for GPT4o, LLama3 pending).
 
 ## Citation
 If you find this useful for your research, please cite the following:
